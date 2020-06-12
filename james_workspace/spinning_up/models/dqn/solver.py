@@ -1,10 +1,11 @@
-import os, random, itertools, sys, pprint
+import os, random, itertools, sys, pprint, h5py, math
 
 import numpy as np
 import tensorflow as tf
 
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.optimizers import Adam
+from utils import utils
 
 from collections import deque
 
@@ -20,11 +21,12 @@ class DQNSolver(StandardAgent):
 
         self.state_size = state_size
         self.action_size = action_size
-        self.memory = deque(maxlen=100000)
-        self.gamma = 1.    # discount rate was 1
+        self.memory_len = 100000
+        self.memory = deque(maxlen=self.memory_len)
+        self.gamma = 1.0    # discount rate was 1
         self.epsilon = 1.0  # exploration rate
         self.epsilon_min = 0.01
-        self.epsilon_decay = 0.995 # 0.995
+        self.epsilon_decay = 0.995
         self.learning_rate = 0.01
         self.learning_rate_decay = 0.01
         self.batch_size = 64
@@ -36,7 +38,7 @@ class DQNSolver(StandardAgent):
             lr=self.learning_rate, 
             decay=self.learning_rate_decay)
 
-        super(DQNSolver, self).__init__(experiment_name + "_" + self.model_name)
+        super(DQNSolver, self).__init__(self.model_name + "_" + experiment_name)
 
         self.load_state()
 
@@ -94,7 +96,7 @@ class DQNSolver(StandardAgent):
             for step in itertools.count():
                 if render:
                     env.render()
-                action = self.act(state).numpy()
+                action = self.act(state, eps=self.epsilon)
                 observation, reward, done, _ = env.step(action)
                 state_next = observation
                 # Custom reward if required by env wrapper
@@ -128,22 +130,24 @@ class DQNSolver(StandardAgent):
                 return True
 
         return False
-    
-    @tf.function
-    def act(self, state):
-        """Take a random action or the most valuable predicted
-        action, based on the agent's model. 
+
+    def act(self, state, eps=0.0):
         """
+        Take a state and return a random action or the most 
+        valuable predictedaction, based on the agent's model. 
+        """
+        assert state.shape == (self.state_size,) or state.shape == (1, self.state_size)
 
         # If in exploration
-        if np.random.rand() <= self.epsilon:
+        if np.random.rand() <= eps:
             return random.randrange(self.action_size)
 
-        if state.ndim == 1:
-            state = tf.reshape(state, (1, state.shape[0]))
-        act_values = self.model(state)
+        if len(state.shape) == 1:
+            state = np.reshape(state, (1, state.shape[0]))
         
-        return tf.math.argmax(act_values, axis=-1)
+        act_values = self.model(state)
+
+        return np.argmax(act_values, axis=-1)[0]
     
     def learn(self):
         """Updated the agent's decision network based
@@ -151,11 +155,11 @@ class DQNSolver(StandardAgent):
         Here, we combine the target and action networks.
         """
 
-        minibatch = [
-            self.memory[i] for i in np.random.choice(
+        minibatch_i =  np.random.choice(
                 min(self.batch_size, len(self.memory)),
                 self.batch_size)
-            ]
+
+        minibatch = [self.memory[i] for i in minibatch_i]
 
         loss_value = self.take_training_step(
             *tuple(map(np.array, zip(*minibatch)))
@@ -164,10 +168,13 @@ class DQNSolver(StandardAgent):
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
+        return loss_value
+
     @tf.function
     def take_training_step(self, sts, a, r, n_sts, d):
 
-        future_q_pred = tf.math.reduce_max(self.model(n_sts), axis=-1)
+        # TODO - can also learn OFF policy; e.g. q_predictions_off_a
+        future_q_pred = tf.math.reduce_max(self.model(n_sts), axis=1)
         future_q_pred = tf.where(d, tf.zeros((1,), dtype=tf.dtypes.float64), future_q_pred)
         q_targets = r + self.gamma * future_q_pred
 
@@ -185,9 +192,10 @@ class DQNSolver(StandardAgent):
         the actual values plus the discounted next state by the target Q network
         """
         with tf.GradientTape() as tape:
+
             q_predictions = self.model(states)
-            print(q_predictions)
             
+            # TODO - can also learn OFF policy; e.g. q_predictions_off_a
             gather_indices = tf.range(self.batch_size) * tf.shape(q_predictions)[-1] + action_mask
             q_predictions_at_a = tf.gather(tf.reshape(q_predictions, [-1]), gather_indices)
 
@@ -201,39 +209,63 @@ class DQNSolver(StandardAgent):
         Metadata should be passed to keep information avaialble.
         """
 
-        # TODO move optimizer inside of model save
-        add_to_save = {
-            "epsilon": self.epsilon,
-            "memory": self.memory,
-            "optimizer_config": self.optimizer.get_config(),
-            }
+        self.model.save(self.model_location)
 
-        self.save_state_to_dict(append_dict=add_to_save)
+        data_dict = {key: getattr(self, key) for key in (
+            "model_location", "scores", "total_t",
+            "epsilon")
+        }
 
-        # custom_obj = {
-        #     'epsilon': self.epsilon,
-        #     'memory': self.memory,
-        #     'optimizer_config': self.optimizer.get_config,
-        # }
+        data_dict["trained_episodes"] = len(self.scores)
+        utils.add_to_h5(self.model_location, data_dict)
 
-        self.model.save(self.model_location) # , custom_objects=custom_obj)
+        utils.add_to_h5(
+            self.model_location,
+            self.optimizer.get_config(),
+            group_name="optimizer_config")
+
+        mem_as_tuple_of_arrays = tuple(map(np.array, zip(*self.memory)))
+        memory_arrays = {"tup_" + str(i): mem_as_tuple_of_arrays[i] 
+                         for i in range(len(mem_as_tuple_of_arrays))}
+
+        utils.add_to_h5(self.model_location, memory_arrays, group_name="memory")
 
     def load_state(self):
         """Load a model with the specified name"""
 
-        model_dict = self.load_state_from_dict()
-
-        print("Loaded state:")
-        pprint.pprint(model_dict, depth=1)
-
         print("Loading weights from", self.model_location + "...", end="")
-        
         if os.path.exists(self.model_location):
             self.model = tf.keras.models.load_model(self.model_location)
-            # TODO move inside of model save
-            self.optimizer = self.optimizer.from_config(self.optimizer_config)
-            del self.optimizer_config
-
+            self.model.summary()
             print(" Loaded.")
+
+            with h5py.File(self.model_location, 'r') as hf:
+                
+                self.optimizer = self.optimizer.from_config({
+                    k: hf["optimizer_config"][k][()] 
+                    for k in hf["optimizer_config"].keys()})
+                
+                self.memory = deque(maxlen=self.memory_len)
+                mem = {k: np.array(hf["memory"][k]) for k in hf["memory"].keys()}
+                mem_as_tuple_of_arrays = tuple([mem["tup_" + str(i)] for i in range(len(mem.keys()))])
+                for tup in zip(*mem_as_tuple_of_arrays):
+                    assert all([val is not None for val in tup])
+                    self.memory.append(tup)
+
+                other = {k: hf["custom_group"][k] for k in hf["custom_group"].keys()}
+                self.scores = list(other["scores"])
+                self.epsilon = other["epsilon"][()]
+                self.total_t = other["total_t"][()]
+                
+                data_dict = {
+                    "trained_episodes": len(self.scores),
+                    "epsilon": self.epsilon,
+                    "total_t": self.total_t,
+                    "memory_loaded": len(self.memory)
+                }
+
+            print("Loaded state:")
+            pprint.pprint(data_dict, depth=1)
+
         else:
             print(" Model not yet saved at loaction.")

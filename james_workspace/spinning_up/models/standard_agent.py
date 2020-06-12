@@ -9,24 +9,10 @@ class StandardAgent():
         self.model_location = self.experiment_dir + "model.h5"
         self.dict_location =  self.experiment_dir + "status.p"
 
+        self.scores = []
+        self.total_t = 0
+
         os.makedirs(self.experiment_dir, exist_ok=True)
-
-    def save_state_to_dict(self, append_dict={}):
-
-        model_dict = {}
-
-        for key in ("model_location", "scores", "total_t"):
-            model_dict[key] = getattr(self, key)
-
-        model_dict["trained_episodes"] = len(self.scores)
-
-        for k, v in append_dict.items():
-            model_dict[k] = v
-
-        with open(self.dict_location, 'wb') as md:
-            pickle.dump(model_dict, md)
-
-        return model_dict
 
     def load_state_from_dict(self):
 
@@ -38,8 +24,7 @@ class StandardAgent():
             model_dict = {}
 
         # Initialise standard state if empty, else flexible
-        self.scores = model_dict.get("scores", [])
-        self.total_t = model_dict.get("total_t", 0)
+        
         for k, v in model_dict.items():
             if k in ("scores", "total_t"):
                 continue 
